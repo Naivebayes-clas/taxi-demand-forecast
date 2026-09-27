@@ -26,22 +26,6 @@ End-to-end time series forecasting pipeline for NYC Yellow Cab hourly pickups us
 | *Twin peaks: AM + PM rush* | *Trend + Weekly + Daily = Forecast* |
 
 
-## Architecture
-   
-┌──────────────────┐ ┌─────────────────────────┐ ┌──────────────────────┐
-│ NYC Open Data │           │ Airflow DAG │            | Postgres │
-│ (S3 / Parquet) │──────▶                │ │──────▶│ │
-│                 │ │ 1. ingest_nyc_taxi     │ │ • taxi_trips │
-│ yellow_tripdata │ │ 2. build_hourly_demand │ │ • hourly_demand │
-│ _YYYY-MM.parquet│ │ 3. train_and_forecast │ │ • demand_forecasts │
-└──────────────────┘ └─────────────────────────┘ └──────────┬───────────┘
-│
-┌────────▼───────────┐
-│ Streamlit App │
-│ (this dashboard) │
-└────────────────────┘
-
-
 ## Tech Stack
 
 | Layer | Tool |
