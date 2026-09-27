@@ -1,0 +1,6 @@
+apache-airflow[postgres]
+psycopg2-binary
+pandas
+pyarrow
+prophet
+statsmodels   
