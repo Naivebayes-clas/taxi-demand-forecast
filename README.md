@@ -61,22 +61,6 @@ Interactive Streamlit app with:
 - **Demand Patterns tab** — day-of-week shapes, heatmap, weekly trend
 - **Decomposition tab** — how Prophet splits the signal into trend + weekly + daily
 
-## Project Structure
-   
-taxi-demand-forecast/
-├── dags/
-│ └── taxi_demand_dag.py # Airflow DAG (3 tasks)
-├── app/
-│ └── streamlit_app.py # Interactive dashboard
-├── data/
-│ └── raw/ # Cached Parquet files (.gitignore)
-├── docs/
-│ └── screenshots/ # Dashboard screenshots
-├── run_forecast.py # One-shot script (bypasses Airflow)
-├── requirements.txt
-├── docker-compose.yml
-└── README.md
-
 
 ## Setup
 
@@ -145,6 +129,82 @@ Weekly pattern (slightly different weekend shape)
 Stable trend (no growth/decline over the 3-month window)
 
 
+Lessons Learned: Bugs & Fixes
+
+Real-world debugging log from building this project. Every bug here was hit in production (well, localhost).
+
+### Airflow 3 Breaking Changes
+
+| Bug | Error | Fix |
+|-----|-------|-----|
+| `schedule_interval` parameter removed | `TypeError: DAG.__init__() got an unexpected keyword argument 'schedule_interval'` | Use `schedule="@daily"` instead |
+| `airflow webserver` command removed | `Command 'airflow webserver' has been removed` | Use `airflow api-server` |
+| `airflow users create` removed | `Positional Arguments: GROUP_OR_COMMAND` | Airflow 3 uses SimpleAuthManager — any username/password works on first login |
+| `airflow dags backfill` removed | `Command 'dags backfill' has been removed` | Use `airflow backfill create --dag-id X --from-date X --to-date X` |
+| `airflow backfill create` different args | `the following arguments are required: --dag-id, --from-date, --to-date` | Airflow 3 uses `--dag-id`, `--from-date`, `--to-date` (not positional, no `--yes`) |
+| `airflow backfills list` doesn't exist | `invalid choice: 'backfills'` | Only `airflow backfill create` exists in v3. Cancel via UI or SQL |
+| Port conflict on restart | `[Errno 98] address already in use` | `pkill -f -u <user> airflow` before restarting. Set port in `airflow.cfg` permanently |
+| SQLite "database is locked" | `sqlite3.OperationalError: database is locked` | `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN` env var wasn't active in the shell running `airflow standalone`. Fix: put `sql_alchemy_conn` in `airflow.cfg` |
+
+### Python / Pandas / Prophet
+
+| Bug | Error | Fix |
+|-----|-------|-----|
+| Uppercase `H` frequency removed in Pandas 2.x | `ValueError: Invalid frequency: H. Did you mean h?` | Use `freq="h"` (lowercase) |
+| `.str.startswith()` on datetime64 column | `AttributeError: Can only use .str accessor with string values, not datetime64` | Use `.dt.strftime("%Y-%m-%d") == ds` |
+| 2025+ TLC Parquet dropped lat/long columns | `No match for FieldRef.Name(pickup_longitude)` | Columns now use `PULocationID`/`DOLocationID` (zone IDs). For time series, only need `tpep_pickup_datetime` |
+| `model.predict()` returns ALL rows (history + future) | Table has 2,237 rows instead of 72 | Add `preds = preds.tail(FORECAST_HORIZON)` before `to_sql` |
+| Negative predictions from Prophet | `yhat = -41,879` (impossible for demand) | Apply `np.log1p(y)` before fit, `np.expm1()` after predict, `.clip(lower=0)` |
+| `idxmax()` returns index label, not position | `KeyError: 35` | Use `int(np.argmax(series.values))` for positional index |
+| `TRUNCATE` silently blocked by table lock | Table still has old rows after "successful" run | Use `DELETE FROM table` instead (doesn't require exclusive lock) |
+
+### Airflow Task Execution
+
+| Bug | Error | Fix |
+|-----|-------|-----|
+| `sys.path` doesn't propagate to task runner | `ModuleNotFoundError: No module named 'operators'` | Inline functions in DAG file, or add `sys.path.insert(0, ...)` at top of each operator file |
+| Relative paths (`./data/raw`) fail in task runner | File not found (CWD is `~/airflow/`, not project dir) | Use absolute paths: `os.path.expanduser("~/github_docker/taxi-demand-forecast/data/raw")` |
+| `if_exists="append"` causes duplicates on re-run | Duplicate rows → Prophet sees conflicting values → garbage predictions | Delete that day's rows before inserting: `DELETE FROM table WHERE date = :ds` |
+| `dags_folder` not pointing to project | DAG not appearing in UI | Set `dags_folder = /path/to/project/dags` in `airflow.cfg` |
+| Stale backfill blocks new backfill | `AlreadyRunningBackfill: Another backfill is running` | `DELETE FROM dag_run WHERE dag_id='X'; DELETE FROM backfill WHERE dag_id='X';` in Airflow metadata DB |
+| Airflow 3 `standalone` not dispatching tasks to workers | Tasks stuck in "queued" forever, workers show `<idle>` | Known Airflow 3 bug. Workaround: run `airflow scheduler` and `airflow api-server` separately, or use `airflow tasks test` for single runs |
+
+### Plotly / Streamlit
+
+| Bug | Error | Fix |
+|-----|-------|-----|
+| `arrowhead="up"` invalid | `Invalid value of type 'str' received for 'arrowhead'` | Use integer: `arrowhead=1` (1=open up, 2=filled up, 4=triangle) |
+| `make_subplots` mangles datetime x-axis | X-axis shows 2008–2024 instead of 2025 | Use plain `go.Figure()` per subplot, or use integer x-axis (hour index) |
+| Datetime objects misinterpreted by Plotly | X-axis shows wrong dates regardless of format | Use `st.line_chart()` (Streamlit native) for datetime data. Reserve Plotly for integer/categorical x-axes |
+| `use_container_width` deprecated | `Please replace use_container_width with width` | Use `width='stretch'` (string, not boolean) |
+| `width=True` invalid | Blank page, no error | Must be a string: `width='stretch'` |
+| `@st.cache_data` serves stale data | Table updated but app shows old values | `pkill streamlit` and restart, or call `st.cache_data.clear()` |
+| `st.line_chart` color list length mismatch | `StreamlitColorLengthError: must have same length as columns` | Use list matching column count: `color=["#f5a623", "#0f3460"]` (one per column) |
+| Duplicate columns after DataFrame join | `['Actual', 'Forecast', 'Forecast']` (3 cols, 2 colors) | `merged = merged.loc[:, ~merged.columns.duplicated()]` |
+
+### Docker / System
+
+| Bug | Error | Fix |
+|-----|-------|-----|
+| `pkill -f airflow` kills Docker container processes | `Operation not permitted` (root-owned PIDs) | Use `pkill -f -u <username> airflow` to only kill your processes |
+| Docker Airflow container conflicting with native install | High CPU, port conflicts, ghost processes | `docker stop <container>`. Only run ONE Airflow (native OR Docker) |
+| Postgres container stopped | `Connection refused` on port 5432 | `docker start taxi-postgres` |
+| `createdb` prompts for password in loop | Hangs waiting for input | `PGPASSWORD=your_password createdb ...` or `docker exec taxi-postgres psql -U taxi_user -c "CREATE DATABASE airflow;"` |
+
+### Debugging Strategies That Worked
+
+1. **`airflow tasks test <dag> <task> <date>`** — runs a single task in the terminal with full traceback. Bypasses the scheduler/executor entirely. This is the #1 debugging tool in Airflow.
+
+2. **Check the data, not the code** — when Prophet produced negative predictions, the bug wasn't in the model. It was duplicate rows in `hourly_demand` from `if_exists="append"`. Always `SELECT COUNT(*)` and `GROUP BY ... HAVING COUNT(*) > 1` first.
+
+3. **Kill everything, verify, restart** — when Airflow state is corrupted (stale backfills, locked tables, ghost processes):
+   ```bash
+   pkill -9 -f -u <user> airflow
+   sleep 3
+   ps aux | grep airflow | grep -v grep  # verify empty
+   # Fix DB state
+   # Restart clean
+   airflow standalone   
 
 Roadmap
 [ ] Add more months (6–12) for stronger weekly signal
